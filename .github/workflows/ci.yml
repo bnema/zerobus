@@ -11,13 +11,18 @@ concurrency:
 jobs:
   check:
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        # The oldest supported Go and the newest: allocation behaviour
+        # differs between compiler versions.
+        go: ['1.24', stable]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with:
-          go-version-file: go.mod
+          go-version: ${{ matrix.go }}
       # dbus-daemon runs the integration tests against a private bus.
       - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends dbus
       - run: test -z "$(gofmt -l .)"

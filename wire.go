@@ -161,12 +161,14 @@ func validInterface(s string) bool {
 	if len(s) > 255 {
 		return false
 	}
+	// strings.Cut, not SplitSeq: before Go 1.25 the iterator allocates.
 	n := 0
-	for e := range strings.SplitSeq(s, ".") {
+	for more := true; more; n++ {
+		var e string
+		e, s, more = strings.Cut(s, ".")
 		if !validMember(e) {
 			return false
 		}
-		n++
 	}
 	return n >= 2
 }
@@ -182,7 +184,9 @@ func validBusName(s string) bool {
 		s = s[1:]
 	}
 	n := 0
-	for e := range strings.SplitSeq(s, ".") {
+	for more := true; more; n++ {
+		var e string
+		e, s, more = strings.Cut(s, ".")
 		if e == "" || !unique && e[0] >= '0' && e[0] <= '9' {
 			return false
 		}
@@ -191,7 +195,6 @@ func validBusName(s string) bool {
 				return false
 			}
 		}
-		n++
 	}
 	return n >= 2
 }

@@ -12,7 +12,8 @@ import (
 const (
 	maxMessage = 128 << 20 // the D-Bus limit for a whole message
 	maxArray   = 64 << 20  // the D-Bus limit for one array
-	maxDepth   = 64        // 32 array + 32 struct levels
+	maxNest    = 32        // array or struct levels in one signature
+	maxDepth   = 64        // total levels in a value, variants included
 )
 
 var (
@@ -43,8 +44,12 @@ func pad(off, n int) int { return (off + n - 1) &^ (n - 1) }
 
 // sigEnd returns the index just after the single complete type that starts
 // at sig[i], or -1 if there is none.
-func sigEnd(sig string, i, depth int) int {
-	if i >= len(sig) || depth > maxDepth {
+func sigEnd(sig string, i int) int { return typeEnd(sig, i, 0, 0) }
+
+// typeEnd is sigEnd with the array and struct nesting so far. The spec
+// limits each to 32 levels; dict entries count as structs.
+func typeEnd(sig string, i, arrays, structs int) int {
+	if i >= len(sig) || arrays > maxNest || structs > maxNest {
 		return -1
 	}
 	switch sig[i] {
@@ -52,16 +57,16 @@ func sigEnd(sig string, i, depth int) int {
 		return i + 1
 	case 'a':
 		if i+1 < len(sig) && sig[i+1] == '{' {
-			return dictEnd(sig, i+1, depth+1)
+			return dictEnd(sig, i+1, arrays+1, structs+1)
 		}
-		return sigEnd(sig, i+1, depth+1)
+		return typeEnd(sig, i+1, arrays+1, structs)
 	case '(':
 		j := i + 1
 		if j < len(sig) && sig[j] == ')' {
 			return -1 // empty structs are not allowed
 		}
 		for j < len(sig) && sig[j] != ')' {
-			if j = sigEnd(sig, j, depth+1); j < 0 {
+			if j = typeEnd(sig, j, arrays, structs+1); j < 0 {
 				return -1
 			}
 		}
@@ -75,12 +80,12 @@ func sigEnd(sig string, i, depth int) int {
 
 // dictEnd returns the index just after the dict entry type at sig[i] ('{').
 // Its key must be a basic type and it holds exactly two types.
-func dictEnd(sig string, i, depth int) int {
+func dictEnd(sig string, i, arrays, structs int) int {
 	j := i + 1
-	if j >= len(sig) || !basic(sig[j]) {
+	if j >= len(sig) || !basic(sig[j]) || structs > maxNest {
 		return -1
 	}
-	if j = sigEnd(sig, j+1, depth+1); j < 0 || j >= len(sig) || sig[j] != '}' {
+	if j = typeEnd(sig, j+1, arrays, structs); j < 0 || j >= len(sig) || sig[j] != '}' {
 		return -1
 	}
 	return j + 1
@@ -101,7 +106,7 @@ func validSignature(sig string) bool {
 		return false
 	}
 	for i := 0; i < len(sig); {
-		if i = sigEnd(sig, i, 0); i < 0 {
+		if i = sigEnd(sig, i); i < 0 {
 			return false
 		}
 	}
@@ -331,7 +336,7 @@ func (r *Reader) str(n int) string {
 // value that follows with the matching method, or skip it with Skip.
 func (r *Reader) Variant() string {
 	sig := r.Signature()
-	if r.err == nil && sigEnd(sig, 0, 0) != len(sig) {
+	if r.err == nil && sigEnd(sig, 0) != len(sig) {
 		r.fail()
 		return ""
 	}
@@ -409,17 +414,22 @@ func (r *Reader) ByteArray() []byte {
 
 // Skip reads past values of the given signature. Arrays are skipped by their
 // length, without reading their elements.
-func (r *Reader) Skip(sig string) { r.skip(sig, 0) }
+func (r *Reader) Skip(sig string) { r.skip(sig, 0, false) }
 
-func (r *Reader) skip(sig string, depth int) {
+// check reads every value of sig, array elements included, and fails on any
+// value the bus would reject. It proves an outgoing body matches its
+// signature.
+func (r *Reader) check(sig string) { r.skip(sig, 0, true) }
+
+func (r *Reader) skip(sig string, depth int, strict bool) {
 	for i := 0; i < len(sig) && r.err == nil; {
-		i = r.skipOne(sig, i, depth)
+		i = r.skipOne(sig, i, depth, strict)
 	}
 }
 
 // skipOne skips the value of the type at sig[i] and returns the index of the
-// next type.
-func (r *Reader) skipOne(sig string, i, depth int) int {
+// next type. In strict mode it also reads array elements and checks values.
+func (r *Reader) skipOne(sig string, i, depth int, strict bool) int {
 	if depth > maxDepth {
 		r.fail()
 		return len(sig)
@@ -429,24 +439,38 @@ func (r *Reader) skipOne(sig string, i, depth int) int {
 		r.take(1, 1)
 	case 'n', 'q':
 		r.take(2, 2)
-	case 'b', 'i', 'u', 'h':
+	case 'b':
+		r.Bool()
+	case 'i', 'u', 'h':
 		r.take(4, 4)
 	case 'x', 't', 'd':
 		r.take(8, 8)
 	case 's', 'o':
-		r.Str()
+		s := r.Str()
+		if strict && (!utf8.ValidString(s) || c == 'o' && !validPath(s)) {
+			r.fail()
+		}
 	case 'g':
-		r.Signature()
+		if s := r.Signature(); strict && !validSignature(s) {
+			r.fail()
+		}
 	case 'v':
-		r.skip(r.Variant(), depth+1)
+		r.skip(r.Variant(), depth+1, strict)
 	case 'a':
-		end := sigEnd(sig, i, depth)
-		if end < 0 {
+		next := sigEnd(sig, i)
+		if next < 0 {
 			r.fail()
 			return len(sig)
 		}
-		r.SkipTo(r.Array(sig[i+1]))
-		return end
+		end := r.Array(sig[i+1])
+		if !strict {
+			r.SkipTo(end)
+			return next
+		}
+		for r.More(end) {
+			r.skipOne(sig, i+1, depth+1, true)
+		}
+		return next
 	case '(', '{':
 		closer := byte(')')
 		if c == '{' {
@@ -455,7 +479,7 @@ func (r *Reader) skipOne(sig string, i, depth int) int {
 		r.Struct()
 		j := i + 1
 		for j < len(sig) && sig[j] != closer && r.err == nil {
-			j = r.skipOne(sig, j, depth+1)
+			j = r.skipOne(sig, j, depth+1, strict)
 		}
 		if j >= len(sig) {
 			r.fail()
@@ -570,7 +594,7 @@ func (e *Encoder) text(s string) {
 
 // Variant writes the signature of a VARIANT (v). Write its value next.
 func (e *Encoder) Variant(sig string) {
-	if sigEnd(sig, 0, 0) != len(sig) {
+	if sigEnd(sig, 0) != len(sig) {
 		e.invalid()
 	}
 	e.Signature(sig)

@@ -156,6 +156,63 @@ func TestSignalAndMethodBetweenPeers(t *testing.T) {
 	}
 }
 
+func TestHandleDuringCall(t *testing.T) {
+	addr := privateBus(t)
+	c := dial(t, addr)
+	peer := dial(t, addr)
+	if err := c.AddMatch("type='signal',interface='org.example.Ping'"); err != nil {
+		t.Fatal(err)
+	}
+	peer.NewSignal("/a", "org.example.Ping", "Ping", "")
+	if _, err := peer.Send(); err != nil {
+		t.Fatal(err)
+	}
+	// A round trip from the peer proves the bus has routed the signal.
+	peer.NewCall(busName, busPath, busName, "GetId", "")
+	if _, err := peer.Call(); err != nil {
+		t.Fatal(err)
+	}
+
+	var got string
+	var nested error
+	c.Handle = func(m *Message) {
+		if m.Member == "Ping" {
+			got = strings.Clone(m.Member)
+			_, nested = c.ReadMessage()
+			// Sending from Handle is allowed.
+			c.NewSignal("/a", "org.example.Pong", "Pong", "")
+			if _, err := c.Send(); err != nil {
+				t.Error(err)
+			}
+		}
+	}
+	// The signal is queued before the reply, so Call passes it to Handle.
+	c.NewCall(busName, busPath, busName, "GetId", "")
+	if _, err := c.Call(); err != nil {
+		t.Fatal(err)
+	}
+	if got != "Ping" || !errors.Is(nested, ErrNested) {
+		t.Fatalf("handled %q, nested read: %v", got, nested)
+	}
+}
+
+func TestCallRejectsNoReply(t *testing.T) {
+	c := dial(t, privateBus(t))
+	c.NewCall(busName, busPath, busName, "GetId", "").SetFlags(FlagNoReplyExpected)
+	if _, err := c.Call(); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("err = %v, want ErrInvalid", err)
+	}
+	c.NewSignal("/a", "a.b", "C", "")
+	if _, err := c.Call(); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("Call on a signal: %v, want ErrInvalid", err)
+	}
+	// The connection still works.
+	c.NewCall(busName, busPath, busName, "GetId", "")
+	if _, err := c.Call(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestCloseUnblocksRead(t *testing.T) {
 	c := dial(t, privateBus(t))
 	errc := make(chan error, 1)

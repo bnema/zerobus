@@ -2,6 +2,7 @@ package zerobus
 
 import (
 	"bytes"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -18,8 +19,12 @@ const (
 	defaultBufSz = 16 << 10
 )
 
-// ErrClosed reports a read or send on a closed or broken connection.
-var ErrClosed = errors.New("zerobus: connection closed")
+var (
+	// ErrClosed reports a read or send on a closed or broken connection.
+	ErrClosed = errors.New("zerobus: connection closed")
+	// ErrNested reports a Call or ReadMessage made from inside Conn.Handle.
+	ErrNested = errors.New("zerobus: Call or ReadMessage inside Handle")
+)
 
 // Error is a D-Bus error reply.
 type Error struct {
@@ -49,10 +54,14 @@ type Conn struct {
 	msg        Message
 	enc        Encoder
 	err        error // sticky: the connection is unusable after it
+	handling   bool  // inside Handle
 
 	// Handle receives the messages that arrive while Call waits for its
-	// reply. It may be nil; those messages are then dropped. It must not
-	// call Call, Send or ReadMessage.
+	// reply. It may be nil; those messages are then dropped.
+	//
+	// Handle may answer or emit messages with NewReply, NewError,
+	// NewSignal and Send. It may not wait: Call and ReadMessage return
+	// ErrNested inside it.
 	Handle func(*Message)
 }
 
@@ -65,7 +74,7 @@ func SessionBus() (*Conn, error) {
 		if dir == "" {
 			return nil, errors.New("zerobus: no session bus: DBUS_SESSION_BUS_ADDRESS and XDG_RUNTIME_DIR are not set")
 		}
-		addr = "unix:path=" + dir + "/bus"
+		return dialSocket(dir + "/bus")
 	}
 	return Dial(addr)
 }
@@ -124,6 +133,12 @@ func dialOne(addr string) (*Conn, error) {
 	if sock == "" {
 		return nil, fmt.Errorf("zerobus: address %q has no path or abstract socket", addr)
 	}
+	return dialSocket(sock)
+}
+
+// dialSocket connects to the Unix socket sock ("@name" for an abstract
+// one), authenticates, and registers with the bus.
+func dialSocket(sock string) (*Conn, error) {
 	uc, err := net.DialUnix("unix", nil, &net.UnixAddr{Name: sock, Net: "unix"})
 	if err != nil {
 		return nil, fmt.Errorf("zerobus: %w", err)
@@ -278,18 +293,22 @@ func (c *Conn) Send() (uint32, error) {
 		c.err = closedErr(err)
 		return 0, c.err
 	}
-	return readSerial(b), nil
-}
-
-func readSerial(b []byte) uint32 {
-	return uint32(b[8]) | uint32(b[9])<<8 | uint32(b[10])<<16 | uint32(b[11])<<24
+	return binary.LittleEndian.Uint32(b[8:]), nil
 }
 
 // Call sends the method call being built and waits for its reply. Messages
 // that arrive meanwhile go to Handle. An error reply returns an *Error.
+// A call flagged FlagNoReplyExpected gets no reply: send it with Send.
 //
 // The reply is valid until the next read, like ReadMessage's.
 func (c *Conn) Call() (*Message, error) {
+	if c.handling {
+		return nil, ErrNested
+	}
+	if c.enc.body != 0 && (Type(c.enc.buf[1]) != TypeMethodCall || Flags(c.enc.buf[2])&FlagNoReplyExpected != 0) {
+		c.enc.body = 0
+		return nil, ErrInvalid
+	}
 	serial, err := c.Send()
 	if err != nil {
 		return nil, err
@@ -306,9 +325,15 @@ func (c *Conn) Call() (*Message, error) {
 			return m, nil
 		}
 		if c.Handle != nil {
-			c.Handle(m)
+			c.handle(m)
 		}
 	}
+}
+
+func (c *Conn) handle(m *Message) {
+	c.handling = true
+	defer func() { c.handling = false }()
+	c.Handle(m)
 }
 
 // replyError builds an *Error from an error reply. It copies the strings so
@@ -326,6 +351,9 @@ func replyError(m *Message) *Error {
 // ReadMessage blocks until the next message arrives. The message and its
 // strings are valid until the next call to ReadMessage or Call.
 func (c *Conn) ReadMessage() (*Message, error) {
+	if c.handling {
+		return nil, ErrNested
+	}
 	if c.err != nil {
 		return nil, c.err
 	}

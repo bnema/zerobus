@@ -3,7 +3,7 @@
 A small D-Bus client for Go that does not allocate once it is running.
 
 ```sh
-go get github.com/bnema/zerobus
+go get github.com/bnema/zerobus   # Go 1.24 or newer
 ```
 
 - **Zero allocations per message.** After the first few messages warm up its buffers, a call, a reply or a signal costs no heap allocation.
@@ -33,7 +33,7 @@ if err != nil {
 owner := m.Body().Str()
 ```
 
-Build a message with `NewCall`, `NewSignal`, `NewReply` or `NewError`, write its body in the order of its signature, then send it with `Call` (wait for the reply) or `Send` (do not wait). `Send` checks that the body matches the signature and refuses invalid names and strings before they reach the bus.
+Build a message with `NewCall`, `NewSignal`, `NewReply` or `NewError`, write its body in the order of its signature, then send it with `Call` (wait for the reply) or `Send` (do not wait). Before sending, zerobus reads the whole body back with its signature and checks names, paths and strings, so an invalid message returns `ErrInvalid` instead of getting the connection dropped by the bus.
 
 ## Read values
 
@@ -79,7 +79,7 @@ for {
 }
 ```
 
-`Call` reads messages until its reply arrives. Set `Conn.Handle` to receive the signals that arrive meanwhile; they are dropped otherwise.
+`Call` reads messages until its reply arrives. Set `Conn.Handle` to receive the messages that arrive meanwhile; they are dropped otherwise. `Handle` may send (answer a call, emit a signal), but not wait: `Call` and `ReadMessage` return `ErrNested` inside it.
 
 ## Answer calls
 

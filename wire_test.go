@@ -2,6 +2,7 @@ package zerobus
 
 import (
 	"errors"
+	"strings"
 	"testing"
 )
 
@@ -16,6 +17,25 @@ func TestSignatures(t *testing.T) {
 	for _, s := range invalid {
 		if validSignature(s) {
 			t.Errorf("%q should be invalid", s)
+		}
+	}
+	// The spec allows 32 nested arrays and 32 nested structs.
+	nest := func(open, close string, n int) string {
+		return strings.Repeat(open, n) + "y" + strings.Repeat(close, n)
+	}
+	for _, c := range []struct {
+		sig string
+		ok  bool
+	}{
+		{nest("a", "", 32), true},
+		{nest("a", "", 33), false},
+		{nest("(", ")", 32), true},
+		{nest("(", ")", 33), false},
+		{nest("a(", ")", 32), true},
+		{strings.Repeat("a{s", 33) + "y" + strings.Repeat("}", 33), false},
+	} {
+		if validSignature(c.sig) != c.ok {
+			t.Errorf("validSignature(%d bytes) = %v, want %v", len(c.sig), !c.ok, c.ok)
 		}
 	}
 }
@@ -46,10 +66,25 @@ func TestNames(t *testing.T) {
 			t.Errorf("member %q should be invalid", s)
 		}
 	}
+	for name, h := range map[string][4]string{ // dest, path, iface, member
+		"bad destination": {"bad name", "/a", "a.b", "M"},
+		"call no path":    {"a.b", "", "a.b", "M"},
+		"call no member":  {"a.b", "/a", "a.b", ""},
+	} {
+		var e Encoder
+		e.begin(TypeMethodCall, 1, 0, h[0], h[1], h[2], h[3], "", "")
+		if _, err := e.finish(); !errors.Is(err, ErrInvalid) {
+			t.Errorf("%s accepted: %v", name, err)
+		}
+	}
 	var e Encoder
-	e.begin(TypeMethodCall, 1, 0, "bad name", "/a", "a.b", "M", "", "")
+	e.begin(TypeSignal, 1, 0, "", "/a", "", "C", "", "")
 	if _, err := e.finish(); !errors.Is(err, ErrInvalid) {
-		t.Fatalf("bad destination accepted: %v", err)
+		t.Errorf("signal without interface accepted: %v", err)
+	}
+	e.begin(TypeError, 1, 1, "", "", "", "", "", "")
+	if _, err := e.finish(); !errors.Is(err, ErrInvalid) {
+		t.Errorf("error without name accepted: %v", err)
 	}
 }
 
@@ -211,10 +246,26 @@ func TestEncoderRejects(t *testing.T) {
 		"wrong type":      func(e *Encoder) { e.Byte(1) },
 		"extra value":     func(e *Encoder) { e.Str("a"); e.Str("b") },
 		"bad variant sig": func(e *Encoder) { e.Variant("ss") },
+		"wrong element": func(e *Encoder) {
+			a := e.BeginArray('s')
+			e.Uint32(77)
+			e.EndArray(a)
+		},
+		"bad nested variant": func(e *Encoder) {
+			a := e.BeginArray('v')
+			e.Byte(1)
+			e.Str("z")
+			e.EndArray(a)
+		},
 	}
+	sigs := map[string]string{"wrong element": "as", "bad nested variant": "av"}
 	for name, f := range cases {
+		sig := sigs[name]
+		if sig == "" {
+			sig = "s"
+		}
 		var e Encoder
-		e.begin(TypeSignal, 1, 0, "", "/a", "a.b", "C", "", "s")
+		e.begin(TypeSignal, 1, 0, "", "/a", "a.b", "C", "", sig)
 		f(&e)
 		if _, err := e.finish(); !errors.Is(err, ErrInvalid) {
 			t.Errorf("%s: err = %v, want ErrInvalid", name, err)
@@ -226,13 +277,14 @@ func TestParseRejects(t *testing.T) {
 	var e Encoder
 	good := append([]byte(nil), build(&e)...)
 	mutate := map[string]func(b []byte) []byte{
-		"bad endian":  func(b []byte) []byte { b[0] = 'x'; return b },
-		"bad version": func(b []byte) []byte { b[3] = 2; return b },
-		"zero serial": func(b []byte) []byte { b[8], b[9], b[10], b[11] = 0, 0, 0, 0; return b },
-		"short body":  func(b []byte) []byte { return b[:len(b)-1] },
-		"huge body":   func(b []byte) []byte { b[7] = 0xff; return b },
-		"no member":   func(b []byte) []byte { return dropField(b, fieldMember) },
-		"bad padding": func(b []byte) []byte { return dirtyPadding(b) },
+		"bad endian":   func(b []byte) []byte { b[0] = 'x'; return b },
+		"bad version":  func(b []byte) []byte { b[3] = 2; return b },
+		"zero serial":  func(b []byte) []byte { b[8], b[9], b[10], b[11] = 0, 0, 0, 0; return b },
+		"short body":   func(b []byte) []byte { return b[:len(b)-1] },
+		"huge body":    func(b []byte) []byte { b[7] = 0xff; return b },
+		"no member":    func(b []byte) []byte { return dropField(b, fieldMember) },
+		"bad padding":  func(b []byte) []byte { return dirtyPadding(b) },
+		"no signature": func(b []byte) []byte { return dropField(b, fieldSignature) },
 	}
 	for name, f := range mutate {
 		b := f(append([]byte(nil), good...))
@@ -329,6 +381,34 @@ func FuzzParse(f *testing.F) {
 		}
 		r := m.Body()
 		r.Skip(m.Signature)
+	})
+}
+
+// FuzzCheck checks that every body the encoder accepts parses back with
+// its signature.
+func FuzzCheck(f *testing.F) {
+	f.Add("a{sv}", []byte{8, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 'a', 0, 1, 'u', 0, 0, 0, 0, 7, 0, 0, 0})
+	f.Add("as", []byte{4, 0, 0, 0, 77, 0, 0, 0})
+	f.Fuzz(func(t *testing.T, sig string, body []byte) {
+		if !validSignature(sig) {
+			return
+		}
+		var e Encoder
+		e.begin(TypeSignal, 1, 0, "", "/a", "a.b", "C", "", sig)
+		e.buf = append(e.buf, body...)
+		b, err := e.finish()
+		if err != nil {
+			return
+		}
+		var m Message
+		if err := parse(b, &m); err != nil {
+			t.Fatalf("accepted body does not parse: %v", err)
+		}
+		r := m.Body()
+		r.check(m.Signature)
+		if !r.Done() {
+			t.Fatalf("accepted body does not match its signature: %v", r.Err())
+		}
 	})
 }
 

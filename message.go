@@ -1,9 +1,6 @@
 package zerobus
 
-import (
-	"encoding/binary"
-	"math"
-)
+import "encoding/binary"
 
 // Type is the kind of a message.
 type Type byte
@@ -175,7 +172,8 @@ func parse(b []byte, m *Message) error {
 		}
 	}
 	m.body = b[start:]
-	if !validSignature(m.Signature) || m.Path != "" && !validPath(m.Path) {
+	// No signature means an empty body.
+	if m.Signature == "" && bodyLen != 0 || !validSignature(m.Signature) || m.Path != "" && !validPath(m.Path) {
 		return ErrMalformed
 	}
 	switch m.Type {
@@ -205,10 +203,25 @@ func (e *Encoder) begin(t Type, serial, replySerial uint32, dest, path, iface, m
 	e.buf = append(e.buf[:0], 'l', byte(t), 0, 1, 0, 0, 0, 0)
 	e.buf = binary.LittleEndian.AppendUint32(e.buf, serial)
 	e.body, e.sig, e.err = 0, sig, nil
-	// A bus disconnects a client that sends an invalid name.
+	// A bus disconnects a client that sends an invalid name or leaves out a
+	// field its message type requires.
 	if dest != "" && !validBusName(dest) || iface != "" && !validInterface(iface) ||
 		member != "" && !validMember(member) || errName != "" && !validInterface(errName) {
 		e.invalid()
+	}
+	switch t {
+	case TypeMethodCall:
+		if path == "" || member == "" {
+			e.invalid()
+		}
+	case TypeSignal:
+		if path == "" || iface == "" || member == "" {
+			e.invalid()
+		}
+	case TypeError:
+		if errName == "" {
+			e.invalid()
+		}
 	}
 	fields := e.BeginArray('(')
 	str := func(code byte, typ, v string) {
@@ -253,15 +266,14 @@ func (e *Encoder) finish() ([]byte, error) {
 	if e.err != nil {
 		return nil, e.err
 	}
-	n := len(e.buf) - e.body
-	if len(e.buf) > maxMessage || n > math.MaxUint32 {
+	if len(e.buf) > maxMessage {
 		return nil, ErrTooLarge
 	}
-	binary.LittleEndian.PutUint32(e.buf[4:], uint32(n))
-	// Reading the body back with the signature proves it matches: a bus
-	// disconnects a client that sends a body that does not.
+	binary.LittleEndian.PutUint32(e.buf[4:], uint32(len(e.buf)-e.body))
+	// Reading the whole body back with the signature proves it matches: a
+	// bus disconnects a client that sends a body that does not.
 	r := Reader{buf: e.buf[e.body:]}
-	r.Skip(e.sig)
+	r.check(e.sig)
 	if !r.Done() {
 		return nil, ErrInvalid
 	}

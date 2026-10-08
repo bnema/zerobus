@@ -161,7 +161,6 @@ func validInterface(s string) bool {
 	if len(s) > 255 {
 		return false
 	}
-	// strings.Cut, not SplitSeq: before Go 1.25 the iterator allocates.
 	n := 0
 	for more := true; more; n++ {
 		var e string

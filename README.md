@@ -3,7 +3,7 @@
 A small D-Bus client for Go that does not allocate once it is running.
 
 ```sh
-go get github.com/bnema/zerobus   # Go 1.24 or newer
+go get github.com/bnema/zerobus   # Go 1.27 or newer
 ```
 
 - **Zero allocations per message.** After the first few messages warm up its buffers, a call, a reply or a signal costs no heap allocation.

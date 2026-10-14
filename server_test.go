@@ -1,6 +1,7 @@
 package zerobus
 
 import (
+	"errors"
 	"net"
 	"path/filepath"
 	"testing"
@@ -228,7 +229,9 @@ func waitReadable(t *testing.T, c *Conn) {
 	if err := rc.Control(func(f uintptr) { fd = int(f) }); err != nil {
 		t.Fatal(err)
 	}
-	if err := waitFd(fd, 5*time.Second); err != nil {
+	if err := waitFd(fd, 5*time.Second); errors.Is(err, errNoWaitFd) {
+		t.Skip(err)
+	} else if err != nil {
 		t.Fatal(err)
 	}
 }

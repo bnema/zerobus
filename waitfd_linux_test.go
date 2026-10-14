@@ -1,11 +1,15 @@
 package zerobus
 
 import (
+	"errors"
 	"fmt"
 	"syscall"
 	"time"
 	"unsafe"
 )
+
+// errNoWaitFd is returned where waitFd is not supported; never on Linux.
+var errNoWaitFd = errors.New("waitFd: not supported on this platform")
 
 // waitFd blocks until fd is readable or the timeout passes, as a poll loop
 // does.

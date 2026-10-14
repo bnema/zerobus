@@ -3,10 +3,8 @@ package zerobus
 import (
 	"net"
 	"path/filepath"
-	"syscall"
 	"testing"
 	"time"
-	"unsafe"
 )
 
 // socketPair returns a Conn whose socket is the client end of a Unix socket,
@@ -60,6 +58,11 @@ func TestNewSignalToSetsDestination(t *testing.T) {
 	c.NewSignalTo("not a name", "/a", "a.b", "Hit", "")
 	if _, err := c.Send(); err == nil {
 		t.Fatal("invalid destination accepted")
+	}
+
+	c.NewSignalTo("", "/a", "a.b", "Hit", "")
+	if _, err := c.Send(); err == nil {
+		t.Fatal("directed signal without destination accepted")
 	}
 }
 
@@ -225,13 +228,8 @@ func waitReadable(t *testing.T, c *Conn) {
 	if err := rc.Control(func(f uintptr) { fd = int(f) }); err != nil {
 		t.Fatal(err)
 	}
-	var set syscall.FdSet
-	bits := int(unsafe.Sizeof(set.Bits[0])) * 8
-	set.Bits[fd/bits] |= 1 << (uint(fd) % uint(bits))
-	tv := syscall.Timeval{Sec: 5}
-	n, err := syscall.Select(fd+1, &set, nil, nil, &tv)
-	if err != nil || n != 1 {
-		t.Fatalf("select = %d, %v", n, err)
+	if err := waitFd(fd, 5*time.Second); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -269,11 +267,14 @@ func TestMethodCallAllocations(t *testing.T) {
 	}
 	// The replies must be read for the test to leave the bus quiet; they
 	// also prove the calls were well formed.
-	deadline := time.Now().Add(5 * time.Second)
-	for got := 0; got < 202 && time.Now().Before(deadline); {
+	if err := c.c.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	got := 0
+	for got < 202 {
 		m, err := c.ReadMessage()
 		if err != nil {
-			t.Fatal(err)
+			t.Fatalf("after %d of 202 replies: %v", got, err)
 		}
 		if m.Type == TypeMethodReturn && m.ReplySerial <= serial {
 			got++

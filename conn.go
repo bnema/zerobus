@@ -267,9 +267,13 @@ func (c *Conn) NewSignal(path, iface, member, sig string) *Encoder {
 
 // NewSignalTo starts a signal addressed to the single peer dest, a unique
 // name such as ":1.42" or a well-known name, and returns the encoder for its
-// body. Only dest receives it, whatever match rules other peers have.
+// body. Only dest receives it, whatever match rules other peers have. An
+// empty dest makes Send fail: use NewSignal to broadcast.
 func (c *Conn) NewSignalTo(dest, path, iface, member, sig string) *Encoder {
 	c.enc.begin(TypeSignal, c.nextSerial(), 0, dest, path, iface, member, "", sig)
+	if dest == "" {
+		c.enc.invalid()
+	}
 	return &c.enc
 }
 

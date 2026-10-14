@@ -10,6 +10,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"syscall"
 )
 
 const (
@@ -264,6 +265,23 @@ func (c *Conn) NewSignal(path, iface, member, sig string) *Encoder {
 	return &c.enc
 }
 
+// NewSignalTo starts a signal addressed to the single peer dest, a unique
+// name such as ":1.42" or a well-known name, and returns the encoder for its
+// body. Only dest receives it, whatever match rules other peers have.
+func (c *Conn) NewSignalTo(dest, path, iface, member, sig string) *Encoder {
+	c.enc.begin(TypeSignal, c.nextSerial(), 0, dest, path, iface, member, "", sig)
+	return &c.enc
+}
+
+// NewMethodCall starts a method call like NewCall and also returns its
+// serial. A loop that only uses Send and ReadMessage keeps the serial to
+// recognize the reply later, as Message.ReplySerial, without blocking in Call.
+// The serial is the one Send returns for this message.
+func (c *Conn) NewMethodCall(dest, path, iface, member, sig string) (*Encoder, uint32) {
+	e := c.NewCall(dest, path, iface, member, sig)
+	return e, c.serial
+}
+
 // NewReply starts the reply to the method call m and returns the encoder for
 // its body.
 func (c *Conn) NewReply(m *Message, sig string) *Encoder {
@@ -346,6 +364,31 @@ func replyError(m *Message) *Error {
 		}
 	}
 	return e
+}
+
+// SyscallConn returns the raw socket of the connection, for a poll loop that
+// waits for it to become readable together with other file descriptors.
+// Only wait on the descriptor: read, write and close through the Conn.
+//
+// Bytes already read from the socket are not visible to poll: check Buffered
+// before waiting. After the descriptor turns readable, ReadMessage may still
+// block until the rest of a partially received message arrives.
+func (c *Conn) SyscallConn() (syscall.RawConn, error) { return c.c.SyscallConn() }
+
+// Buffered reports whether ReadMessage can return without waiting for the
+// socket: a complete message, or a sticky error, is already in the receive
+// buffer. A poll loop must call ReadMessage until Buffered is false before it
+// waits on the descriptor again, because ReadMessage reads everything the
+// socket has and a later poll would not see those bytes.
+func (c *Conn) Buffered() bool {
+	if c.err != nil {
+		return true
+	}
+	if c.end-c.start < headerLen {
+		return false
+	}
+	n, err := frameLen(c.rbuf[c.start:c.end])
+	return err != nil || c.end-c.start >= n
 }
 
 // ReadMessage blocks until the next message arrives. The message and its

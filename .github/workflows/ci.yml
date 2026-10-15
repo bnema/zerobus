@@ -9,17 +9,22 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 jobs:
+  # The job runs as root in an Arch container, on Forgejo and GitHub alike.
+  # dbus-daemon runs the integration tests against a private bus; gcc is for
+  # the race detector.
   check:
     runs-on: ubuntu-latest
+    container:
+      image: archlinux:latest
+      options: --init
     steps:
+      - run: pacman -Syu --noconfirm --needed git go gcc dbus
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
-        with:
-          go-version-file: go.mod
-      # dbus-daemon runs the integration tests against a private bus.
-      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends dbus
+      - run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          test "$(go env GOVERSION | cut -d. -f1-2)" = "go$(sed -n 's/^go \([0-9]*\.[0-9]*\).*/\1/p' go.mod)"
       - run: test -z "$(gofmt -l .)"
       - run: go vet ./...
       - run: GOARCH=386 go vet ./...

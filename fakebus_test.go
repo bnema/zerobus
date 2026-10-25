@@ -34,9 +34,17 @@ func fakeBus(t *testing.T, authReply string, frames ...[]byte) string {
 		hello.begin(TypeMethodReturn, 1, 1, "", "", "", "", "", "s")
 		hello.Str(":1.7")
 		b, _ := hello.finish()
-		// The OK line and the Hello reply arrive in the same write: the
-		// client must keep the bytes after the line.
-		if _, err := c.Write(append([]byte(authReply), b...)); err != nil {
+		if _, err := c.Write([]byte(authReply)); err != nil {
+			return
+		}
+		if fdSupported && strings.HasPrefix(authReply, "OK ") {
+			if _, err := r.ReadString('\n'); err != nil {
+				return
+			}
+			if _, err := c.Write(append([]byte("ERROR unsupported\r\n"), b...)); err != nil {
+				return
+			}
+		} else if _, err := c.Write(b); err != nil {
 			return
 		}
 		if _, err := r.ReadString('\n'); err != nil { // BEGIN

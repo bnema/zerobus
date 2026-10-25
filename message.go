@@ -1,6 +1,9 @@
 package zerobus
 
-import "encoding/binary"
+import (
+	"encoding/binary"
+	"os"
+)
 
 // Type is the kind of a message.
 type Type byte
@@ -58,9 +61,11 @@ type Message struct {
 	Sender      string
 	Signature   string // the signature of the body
 
-	body []byte
-	big  bool
-	r    Reader
+	conn   *Conn
+	numFDs uint32
+	body   []byte
+	big    bool
+	r      Reader
 }
 
 // Body returns a reader at the start of the message body. Each call starts
@@ -159,9 +164,7 @@ func parse(b []byte, m *Message) error {
 	if r.err != nil {
 		return r.err
 	}
-	if fds != 0 {
-		return ErrMalformed // fd passing is not negotiated, so none may come
-	}
+	m.numFDs = fds
 	start := pad(r.off, 8)
 	if start+bodyLen != len(b) || start > len(b) {
 		return ErrMalformed
@@ -200,6 +203,8 @@ func parse(b []byte, m *Message) error {
 // begin starts a new message in e: the fixed header and the field array, up
 // to the body. Empty strings are left out of the header.
 func (e *Encoder) begin(t Type, serial, replySerial uint32, dest, path, iface, member, errName, sig string) {
+	e.fds = e.fds[:0]
+	e.fdHeader = false
 	e.buf = append(e.buf[:0], 'l', byte(t), 0, 1, 0, 0, 0, 0)
 	e.buf = binary.LittleEndian.AppendUint32(e.buf, serial)
 	e.body, e.sig, e.err = 0, sig, nil
@@ -269,6 +274,20 @@ func (e *Encoder) finish() ([]byte, error) {
 	if len(e.buf) > maxMessage {
 		return nil, ErrTooLarge
 	}
+	if len(e.fds) > 0 && !e.fdHeader {
+		if len(e.buf) > maxMessage-8 {
+			return nil, ErrTooLarge
+		}
+		// Append one eight-byte header field at the aligned body boundary.
+		old := e.body
+		e.buf = append(e.buf, make([]byte, 8)...)
+		copy(e.buf[old+8:], e.buf[old:len(e.buf)-8])
+		copy(e.buf[old:old+4], []byte{fieldUnixFDs, 1, 'u', 0})
+		binary.LittleEndian.PutUint32(e.buf[old+4:], uint32(len(e.fds)))
+		binary.LittleEndian.PutUint32(e.buf[12:], uint32(old+8-headerLen))
+		e.body += 8
+		e.fdHeader = true
+	}
 	binary.LittleEndian.PutUint32(e.buf[4:], uint32(len(e.buf)-e.body))
 	// Reading the whole body back with the signature proves it matches: a
 	// bus disconnects a client that sends a body that does not.
@@ -278,4 +297,25 @@ func (e *Encoder) finish() ([]byte, error) {
 		return nil, ErrInvalid
 	}
 	return e.buf, nil
+}
+
+// NumFDs returns the number of descriptors attached to this message.
+func (m *Message) NumFDs() int { return int(m.numFDs) }
+
+// TakeFD transfers descriptor i to the caller, who must close the returned file.
+// Untaken descriptors are closed on the next ReadMessage or Call, or Close.
+// Like Body, this method is valid only until the next read.
+func (m *Message) TakeFD(i uint32) (*os.File, error) {
+	if m.conn == nil {
+		return nil, ErrInvalid
+	}
+	c := m.conn
+	c.fdMu.Lock()
+	defer c.fdMu.Unlock()
+	if i >= uint32(len(c.pending)) || c.pending[i] < 0 {
+		return nil, ErrInvalid
+	}
+	fd := c.pending[i]
+	c.pending[i] = -1
+	return os.NewFile(uintptr(fd), "zerobus-received"), nil
 }

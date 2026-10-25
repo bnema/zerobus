@@ -288,8 +288,7 @@ func (r *Reader) Uint32() uint32 {
 }
 
 // UnixFD reads a UNIX_FD (h): an index into the fds sent with the message.
-// zerobus does not receive file descriptors, so the index has nothing to
-// point to; it is only read so the following values can be.
+// Pass this index to Message.TakeFD to take ownership.
 func (r *Reader) UnixFD() uint32 { return r.Uint32() }
 
 // Int64 reads an INT64 (x).
@@ -501,10 +500,12 @@ func (r *Reader) skipOne(sig string, i, depth int, strict bool) int {
 //
 // Errors are sticky and reported by Conn.Send.
 type Encoder struct {
-	buf  []byte
-	body int    // offset of the body; 0 when no message is being built
-	sig  string // body signature, checked by finish
-	err  error
+	fdHeader bool
+	fds      []int
+	buf      []byte
+	body     int    // offset of the body; 0 when no message is being built
+	sig      string // body signature, checked by finish
+	err      error
 }
 
 func (e *Encoder) invalid() {
@@ -645,4 +646,16 @@ func (e *Encoder) SetFlags(f Flags) {
 	if e.body != 0 {
 		e.buf[2] = byte(f)
 	}
+}
+
+// UnixFD appends a UNIX_FD index and attaches fd to the outgoing message.
+// The caller retains ownership and must keep fd valid until Send or Call returns.
+// Descriptor passing requires successful Linux Unix-FD negotiation.
+func (e *Encoder) UnixFD(fd int) {
+	if fd < 0 {
+		e.invalid()
+		return
+	}
+	e.Uint32(uint32(len(e.fds)))
+	e.fds = append(e.fds, fd)
 }

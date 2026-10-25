@@ -16,6 +16,14 @@
 // message whose ReplySerial is that serial. Decode a message completely before
 // the next Send is built and the next read: both reuse the same buffers.
 //
+// # Unix file descriptors
+//
+// On Linux, UnixFDs reports negotiated descriptor support. Encoder.UnixFD
+// borrows an outgoing descriptor until Send or Call returns. Message.TakeFD
+// takes ownership of a received descriptor indexed by Reader.UnixFD; the caller
+// must close it. Untaken descriptors are closed on the next read, Call or Close.
+// Other platforms do not negotiate descriptor support.
+//
 // # Polling
 //
 // A loop that also waits for other descriptors gets the socket from

@@ -10,6 +10,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 )
 
@@ -46,9 +47,20 @@ func (e *Error) Error() string {
 // usually an event loop around ReadMessage. Close may be called from any
 // goroutine to stop a blocked read.
 type Conn struct {
-	c      *net.UnixConn
-	serial uint32
-	name   string
+	recvBuf                   []byte
+	recvN, recvOOB, recvFlags int
+	recvErr                   error
+	recvFn                    func(uintptr) bool
+	raw                       syscall.RawConn
+	fdMu                      sync.Mutex
+	fdClosed                  bool
+	fdQueue                   []int
+	pending                   []int
+	unixFDs                   bool
+	oob                       [512]byte
+	c                         *net.UnixConn
+	serial                    uint32
+	name                      string
 
 	rbuf       []byte // received bytes; rbuf[start:end] are not read yet
 	start, end int
@@ -147,10 +159,10 @@ func dialSocket(sock string) (*Conn, error) {
 	c := &Conn{c: uc, rbuf: make([]byte, defaultBufSz)}
 	c.enc.buf = make([]byte, 0, defaultBufSz)
 	if err := c.auth(); err != nil {
-		return nil, errors.Join(err, uc.Close())
+		return nil, errors.Join(err, c.Close())
 	}
 	if err := c.hello(); err != nil {
-		return nil, errors.Join(err, uc.Close())
+		return nil, errors.Join(err, c.Close())
 	}
 	return c, nil
 }
@@ -193,6 +205,20 @@ func (c *Conn) auth() error {
 	}
 	if !bytes.HasPrefix(reply, []byte("OK ")) {
 		return fmt.Errorf("zerobus: auth rejected: %q", reply)
+	}
+	if fdSupported {
+		if _, err := c.c.Write([]byte("NEGOTIATE_UNIX_FD\r\n")); err != nil {
+			return err
+		}
+		reply, err := c.authLine()
+		if err != nil {
+			return err
+		}
+		if bytes.Equal(reply, []byte("AGREE_UNIX_FD")) {
+			c.unixFDs = true
+		} else if !bytes.HasPrefix(reply, []byte("ERROR")) {
+			return ErrMalformed
+		}
 	}
 	if _, err := c.c.Write([]byte("BEGIN\r\n")); err != nil {
 		return fmt.Errorf("zerobus: auth: %w", err)
@@ -239,7 +265,27 @@ func (c *Conn) hello() error {
 func (c *Conn) UniqueName() string { return c.name }
 
 // Close closes the connection. A blocked ReadMessage returns ErrClosed.
-func (c *Conn) Close() error { return c.c.Close() }
+func (c *Conn) Close() error {
+	err := c.c.Close()
+	c.fdMu.Lock()
+	defer c.fdMu.Unlock()
+	c.fdClosed = true
+	closeFDs(c.fdQueue)
+	c.fdQueue = c.fdQueue[:0]
+	closeFDs(c.pending)
+	c.pending = c.pending[:0]
+	return err
+}
+
+// UnixFDs reports whether Linux descriptor passing was negotiated.
+func (c *Conn) UnixFDs() bool { return c.unixFDs }
+
+func (c *Conn) releasePending() {
+	c.fdMu.Lock()
+	defer c.fdMu.Unlock()
+	closeFDs(c.pending)
+	c.pending = c.pending[:0]
+}
 
 func (c *Conn) nextSerial() uint32 {
 	c.serial++
@@ -311,7 +357,10 @@ func (c *Conn) Send() (uint32, error) {
 	if err != nil {
 		return 0, err
 	}
-	if _, err := c.c.Write(b); err != nil {
+	if len(c.enc.fds) > 0 && !c.unixFDs {
+		return 0, ErrInvalid
+	}
+	if err := c.writeMessage(b, c.enc.fds); err != nil {
 		c.err = closedErr(err)
 		return 0, c.err
 	}
@@ -327,6 +376,7 @@ func (c *Conn) Call() (*Message, error) {
 	if c.handling {
 		return nil, ErrNested
 	}
+	c.releasePending()
 	if c.enc.body != 0 && (Type(c.enc.buf[1]) != TypeMethodCall || Flags(c.enc.buf[2])&FlagNoReplyExpected != 0) {
 		c.enc.body = 0
 		return nil, ErrInvalid
@@ -401,6 +451,7 @@ func (c *Conn) ReadMessage() (*Message, error) {
 	if c.handling {
 		return nil, ErrNested
 	}
+	c.releasePending()
 	if c.err != nil {
 		return nil, c.err
 	}
@@ -421,6 +472,20 @@ func (c *Conn) ReadMessage() (*Message, error) {
 		c.err = err
 		return nil, err
 	}
+	c.fdMu.Lock()
+	defer c.fdMu.Unlock()
+	nfd := c.msg.numFDs
+	if c.fdClosed {
+		return nil, ErrClosed
+	}
+	if nfd > uint32(len(c.fdQueue)) || nfd > 0 && !c.unixFDs {
+		c.err = ErrMalformed
+		return nil, c.err
+	}
+	c.pending = append(c.pending[:0], c.fdQueue[:int(nfd)]...)
+	copy(c.fdQueue, c.fdQueue[int(nfd):])
+	c.fdQueue = c.fdQueue[:len(c.fdQueue)-int(nfd)]
+	c.msg.conn = c
 	return &c.msg, nil
 }
 
@@ -441,9 +506,9 @@ func (c *Conn) fill(n int) error {
 		c.rbuf = grown
 	}
 	for c.end < n {
-		k, err := c.c.Read(c.rbuf[c.end:])
+		k, err := c.readMessageBytes(c.rbuf[c.end:])
 		c.end += k
-		if err != nil && c.end < n {
+		if err != nil {
 			c.err = closedErr(err)
 			return c.err
 		}

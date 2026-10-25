@@ -104,7 +104,7 @@ A `Conn` is not safe for concurrent use. Use it from one goroutine, usually an e
 ## Not supported
 
 - Transports other than `unix:path` and `unix:abstract` (no TCP, no `launchd`, no `autolaunch`).
-- Passing file descriptors (`UNIX_FD` values can be read, but no descriptors are received).
+- File-descriptor passing on platforms other than Linux.
 - Authentication other than `EXTERNAL`.
 - Reflection-based marshalling, introspection and code generation.
 
@@ -115,3 +115,15 @@ A `Conn` is not safe for concurrent use. Use it from one goroutine, usually an e
 ## License
 
 MIT
+
+## Unix file descriptors (Linux)
+
+`c.UnixFDs()` reports whether the bus agreed to descriptor passing. Encode an
+`h` with `e.UnixFD(int(file.Fd()))`; the caller retains ownership and must keep
+the descriptor open until `Send` or `Call` returns. Sending descriptors without
+negotiation fails before anything is written.
+
+For a received `h`, use `file, err := m.TakeFD(m.Body().UnixFD())` and close the
+returned file when finished. `m.NumFDs()` reports the attached descriptor count.
+Taking an index twice is an error. Untaken descriptors are closed at the start
+of the next `ReadMessage` or `Call`, or when the connection is closed.

@@ -2,6 +2,7 @@ package zerobus
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -12,6 +13,7 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 )
 
 const (
@@ -80,43 +82,59 @@ type Conn struct {
 
 // SessionBus connects to the session bus named by
 // DBUS_SESSION_BUS_ADDRESS, or $XDG_RUNTIME_DIR/bus when it is not set.
-func SessionBus() (*Conn, error) {
+func SessionBus() (*Conn, error) { return SessionBusContext(context.Background()) }
+
+// SessionBusContext is SessionBus with cancellation covering connect, auth and Hello.
+func SessionBusContext(ctx context.Context) (*Conn, error) {
 	addr := os.Getenv("DBUS_SESSION_BUS_ADDRESS")
 	if addr == "" {
 		dir := os.Getenv("XDG_RUNTIME_DIR")
 		if dir == "" {
 			return nil, errors.New("zerobus: no session bus: DBUS_SESSION_BUS_ADDRESS and XDG_RUNTIME_DIR are not set")
 		}
-		return dialSocket(dir + "/bus")
+		return dialSocket(ctx, dir+"/bus")
 	}
-	return Dial(addr)
+	return DialContext(ctx, addr)
 }
 
 // SystemBus connects to the system bus named by DBUS_SYSTEM_BUS_ADDRESS, or
 // the standard socket when it is not set.
-func SystemBus() (*Conn, error) {
+func SystemBus() (*Conn, error) { return SystemBusContext(context.Background()) }
+
+// SystemBusContext is SystemBus with cancellation covering connect, auth and Hello.
+func SystemBusContext(ctx context.Context) (*Conn, error) {
 	addr := os.Getenv("DBUS_SYSTEM_BUS_ADDRESS")
 	if addr == "" {
 		addr = "unix:path=/run/dbus/system_bus_socket"
 	}
-	return Dial(addr)
+	return DialContext(ctx, addr)
 }
 
 // Dial connects to a bus address such as "unix:path=/run/user/1000/bus",
 // authenticates, and registers with the bus. Only unix:path and
 // unix:abstract addresses are supported; with several addresses separated by
 // ';', the first that connects is used.
-func Dial(address string) (*Conn, error) {
+func Dial(address string) (*Conn, error) { return DialContext(context.Background(), address) }
+
+// DialContext is Dial with cancellation covering connect, authentication (including
+// descriptor negotiation), and Hello. The context does not affect the returned Conn.
+func DialContext(ctx context.Context, address string) (*Conn, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, fmt.Errorf("zerobus: %w", err)
+	}
 	var errs []error
 	for a := range strings.SplitSeq(address, ";") {
 		if a == "" {
 			continue
 		}
-		c, err := dialOne(a)
+		c, err := dialOne(ctx, a)
 		if err == nil {
 			return c, nil
 		}
 		errs = append(errs, err)
+		if ctx.Err() != nil {
+			break
+		}
 	}
 	if len(errs) == 0 {
 		return nil, fmt.Errorf("zerobus: empty bus address")
@@ -124,7 +142,7 @@ func Dial(address string) (*Conn, error) {
 	return nil, errors.Join(errs...)
 }
 
-func dialOne(addr string) (*Conn, error) {
+func dialOne(ctx context.Context, addr string) (*Conn, error) {
 	transport, params, ok := strings.Cut(addr, ":")
 	if !ok || transport != "unix" {
 		return nil, fmt.Errorf("zerobus: unsupported address %q", addr)
@@ -146,22 +164,51 @@ func dialOne(addr string) (*Conn, error) {
 	if sock == "" {
 		return nil, fmt.Errorf("zerobus: address %q has no path or abstract socket", addr)
 	}
-	return dialSocket(sock)
+	return dialSocket(ctx, sock)
 }
 
 // dialSocket connects to the Unix socket sock ("@name" for an abstract
 // one), authenticates, and registers with the bus.
-func dialSocket(sock string) (*Conn, error) {
-	uc, err := net.DialUnix("unix", nil, &net.UnixAddr{Name: sock, Net: "unix"})
+func dialSocket(ctx context.Context, sock string) (*Conn, error) {
+	nc, err := (&net.Dialer{}).DialContext(ctx, "unix", sock)
 	if err != nil {
 		return nil, fmt.Errorf("zerobus: %w", err)
 	}
-	c := &Conn{c: uc, rbuf: make([]byte, defaultBufSz)}
+	c := &Conn{c: nc.(*net.UnixConn), rbuf: make([]byte, defaultBufSz)}
 	c.enc.buf = make([]byte, 0, defaultBufSz)
-	if err := c.auth(); err != nil {
-		return nil, errors.Join(err, c.Close())
+	deadline, hasDeadline := ctx.Deadline()
+	if hasDeadline {
+		err = nc.SetDeadline(deadline)
 	}
-	if err := c.hello(); err != nil {
+	done := make(chan struct{})
+	stop := context.AfterFunc(ctx, func() {
+		_ = nc.SetDeadline(time.Unix(1, 0))
+		close(done)
+	})
+	if err == nil {
+		err = c.auth()
+	}
+	if err == nil {
+		err = c.hello()
+	}
+	// AfterFunc's stop does not wait for an already running callback. Join it
+	// before clearing deadlines or handing the socket to the caller.
+	if !stop() {
+		<-done
+	}
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		err = errors.Join(err, ctxErr)
+	} else if err != nil && hasDeadline && !time.Now().Before(deadline) {
+		// The socket timer may fire just before the context timer.
+		var ne net.Error
+		if errors.As(err, &ne) && ne.Timeout() {
+			err = errors.Join(err, context.DeadlineExceeded)
+		}
+	}
+	if err == nil {
+		err = nc.SetDeadline(time.Time{})
+	}
+	if err != nil {
 		return nil, errors.Join(err, c.Close())
 	}
 	return c, nil

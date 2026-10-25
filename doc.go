@@ -3,6 +3,11 @@
 // messages in place, so strings and arrays point into the receive buffer and
 // stay valid only until the next read.
 //
+// DialContext, SessionBusContext and SystemBusContext bound socket connection,
+// authentication and Hello with a context. Cancellation does not affect a
+// successfully returned Conn. Dial, SessionBus and SystemBus use a background
+// context and impose no setup timeout.
+//
 // # Clients and servers
 //
 // A Conn has one encoder and one receive buffer. A client may block in Call,

@@ -35,6 +35,13 @@ owner := m.Body().Str()
 
 Build a message with `NewCall`, `NewSignal`, `NewReply` or `NewError`, write its body in the order of its signature, then send it with `Call` (wait for the reply) or `Send` (do not wait). Before sending, zerobus reads the whole body back with its signature and checks names, paths and strings, so an invalid message returns `ErrInvalid` instead of getting the connection dropped by the bus.
 
+To bound connection setup, use `DialContext(ctx, address)`,
+`SessionBusContext(ctx)`, or `SystemBusContext(ctx)`. Cancellation and deadlines
+cover socket connection, authentication, and Hello; they do not affect the
+returned connection. Context-caused failures wrap `context.Canceled` or
+`context.DeadlineExceeded` for `errors.Is`. The original functions use
+`context.Background()` and have no setup timeout.
+
 ## Read values
 
 Read values in the order of the signature. Errors are sticky: check `Err()` once at the end.

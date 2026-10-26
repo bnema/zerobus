@@ -1,3 +1,3 @@
-module github.com/bnema/zerobus
+module bnema.dev/zerobus
 
 go 1.27

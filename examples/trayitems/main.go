@@ -7,7 +7,7 @@ import (
 	"log"
 	"strings"
 
-	"github.com/bnema/zerobus"
+	"bnema.dev/zerobus"
 )
 
 const (

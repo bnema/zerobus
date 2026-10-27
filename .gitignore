@@ -1,4 +1,5 @@
 .worktrees/
+.worktrees-spec/
 /bin/
 *.test
 *.prof

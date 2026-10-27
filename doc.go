@@ -8,6 +8,17 @@
 // successfully returned Conn. Dial, SessionBus and SystemBus use a background
 // context and impose no setup timeout.
 //
+// # Concurrent clients
+//
+// Dispatcher owns a Conn and runs one reader goroutine for concurrent,
+// context-cancellable Call, asynchronous Go, and bounded Subscribe streams.
+// NewCall or NewSignal locks the encoder: follow it with Call, Go or Send on
+// the same goroutine, with no intervening Dispatcher methods. Delivered Msgs
+// own their storage and remain valid across reads. Close each Msg to release
+// untaken descriptors; abandoning a Pending with a delivered reply can leak
+// descriptors. Signals never carry descriptors. A warm successful Call costs
+// four allocations, while unwanted messages are not detached.
+//
 // # Clients and servers
 //
 // A Conn has one encoder and one receive buffer. A client may block in Call,

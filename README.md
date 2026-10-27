@@ -1,12 +1,12 @@
 # zerobus
 
-A small D-Bus client for Go that does not allocate once it is running.
+A small D-Bus client for Go with a zero-allocation `Conn` and a concurrent `Dispatcher`.
 
 ```sh
 go get bnema.dev/zerobus   # Go 1.27 or newer
 ```
 
-- **Zero allocations per message.** After the first few messages warm up its buffers, a call, a reply or a signal costs no heap allocation.
+- **Zero allocations per message with Conn.** After the first few messages warm up its buffers, a call, a reply or a signal costs no heap allocation. Dispatcher adds concurrency with four allocations per warm successful call.
 - **Zero-copy reads.** Strings and byte arrays point straight into the receive buffer.
 - **Standard library only.**
 - **Small.** It connects over a Unix socket, authenticates with `EXTERNAL`, calls methods, emits signals, answers calls, and adds match rules. Nothing else.
@@ -41,6 +41,52 @@ cover socket connection, authentication, and Hello; they do not affect the
 returned connection. Context-caused failures wrap `context.Canceled` or
 `context.DeadlineExceeded` for `errors.Is`. The original functions use
 `context.Background()` and have no setup timeout.
+
+## Concurrent calls and signal streams
+
+`NewDispatcher(c)` takes exclusive ownership of a `Conn` with a nil `Handle`.
+`DialDispatcher(ctx, address)`, `SessionBusDispatcher(ctx)` and
+`SystemBusDispatcher(ctx)` also connect and authenticate. The dispatcher runs
+one reader goroutine and is safe for concurrent callers:
+
+```go
+d, err := zerobus.SessionBusDispatcher(ctx)
+if err != nil {
+    return err
+}
+defer d.Close()
+
+d.NewCall("org.freedesktop.DBus", "/org/freedesktop/DBus",
+    "org.freedesktop.DBus", "GetNameOwner", "s").Str("org.freedesktop.Notifications")
+m, err := d.Call(ctx)
+if m != nil {
+    defer m.Close()
+}
+if err != nil {
+    return err
+}
+owner := m.Body().Str()
+```
+
+`NewCall`/`NewSignal` locks the encoder until the following `Call`, `Go` or
+`Send`: keep that bracket on one goroutine, with no other dispatcher method
+in between. `Go` returns a `Pending`; wait for `Done()` then call `Result()`.
+`Cancel()` discards even a reply that raced cancellation. `Call(ctx)` returns
+`ctx.Err()` without a reply when cancelled.
+
+Delivered `Msg` values own their storage, so strings and decoded slices remain
+valid across reads. **Close every received Msg**, including error replies, to
+release untaken file descriptors. `TakeFD` transfers ownership to the caller.
+An abandoned Pending that already received descriptors can leak them.
+
+`Subscribe(ctx, zerobus.Match{Path: path, Interface: iface}, 32)` returns a
+bounded signal channel `C`. Delivery never blocks the reader: a full buffer
+drops the newest signal and increments `Dropped()`. Each subscriber gets its
+own Msg; signals never carry file descriptors. `Subscription.Close(ctx)`
+stops delivery and removes its bus match. `Dispatcher.Close()` releases
+waiters, closes subscription channels, and joins the reader; `Done()` and
+`Err()` report terminal state. Incoming method calls receive UnknownMethod;
+use a raw Conn for servers.
 
 ## Read values
 

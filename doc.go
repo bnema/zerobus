@@ -19,6 +19,12 @@
 // descriptors. Signals never carry descriptors. A warm successful Call costs
 // four allocations, while unwanted messages are not detached.
 //
+// Match.Sender must be empty or a unique name starting with ':'. Resolve
+// well-known names with org.freedesktop.DBus.GetNameOwner and pass the unique
+// name; local sender filtering isolates overlapping subscriptions. Subscribe
+// checks cancellation before AddMatch and, if cancellation races its reply,
+// attempts RemoveMatch with a fresh one-second context before returning.
+//
 // # Clients and servers
 //
 // A Conn has one encoder and one receive buffer. A client may block in Call,

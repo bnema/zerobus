@@ -80,7 +80,17 @@ release untaken file descriptors. `TakeFD` transfers ownership to the caller.
 An abandoned Pending that already received descriptors can leak them.
 
 `Subscribe(ctx, zerobus.Match{Path: path, Interface: iface}, 32)` returns a
-bounded signal channel `C`. Delivery never blocks the reader: a full buffer
+bounded signal channel `C`. `Match.Sender` must be empty or a unique name
+(starting with `:`); well-known names are rejected with `ErrInvalid`. Resolve
+well-known names through `org.freedesktop.DBus.GetNameOwner` and pass the
+returned unique name. Sender filtering is also enforced locally, even when
+other subscriptions install broader connection-wide bus rules.
+
+An already-cancelled subscription sends no AddMatch. If cancellation races
+AddMatch's reply, Subscribe attempts RemoveMatch with a fresh one-second
+context before returning the context error (cleanup is best-effort).
+
+Delivery never blocks the reader: a full buffer
 drops the newest signal and increments `Dropped()`. Each subscriber gets its
 own Msg; signals never carry file descriptors. `Subscription.Close(ctx)`
 stops delivery and removes its bus match. `Dispatcher.Close()` releases

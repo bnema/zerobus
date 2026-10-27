@@ -273,3 +273,63 @@ func TestDispatcherMalformedFailsWaiters(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestDispatcherSubscribeCanceledMatch(t *testing.T) {
+	d, b := pairDispatcher(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() { _, err := d.Subscribe(ctx, Match{Interface: "org.example.Test"}, 1); result <- err }()
+	add, err := b.ReadMessage()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if add.Member != "AddMatch" {
+		t.Fatal(add.Member)
+	}
+	rule := string(append([]byte(nil), add.Body().Str()...))
+	// Model the bus installing the rule before the AddMatch reply is received.
+	installed := true
+	cancel()
+	b.NewReply(add, "")
+	if _, err := b.Send(); err != nil {
+		t.Fatal(err)
+	}
+	remove, err := b.ReadMessage()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if remove.Member != "RemoveMatch" || remove.Body().Str() != rule {
+		t.Fatal("missing cleanup")
+	}
+	installed = false
+	b.NewReply(remove, "")
+	if _, err := b.Send(); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-result; !errors.Is(err, context.Canceled) {
+		t.Fatal(err)
+	}
+	// A second RemoveMatch must observe no installed rule, just as the bus does.
+	second := make(chan error, 1)
+	go func() { second <- d.matchCall(context.Background(), "RemoveMatch", rule) }()
+	remove, err = b.ReadMessage()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if installed {
+		t.Fatal("canceled Subscribe left a rule")
+	}
+	b.NewError(remove, "org.freedesktop.DBus.Error.MatchRuleNotFound", "s").Str("not installed")
+	if _, err := b.Send(); err != nil {
+		t.Fatal(err)
+	}
+	var busErr *Error
+	if err := <-second; !errors.As(err, &busErr) || busErr.Name != "org.freedesktop.DBus.Error.MatchRuleNotFound" {
+		t.Fatal(err)
+	}
+	// An already-canceled context must send nothing. The next frame is a marker.
+	if _, err := d.Subscribe(ctx, Match{}, 1); !errors.Is(err, context.Canceled) {
+		t.Fatal(err)
+	}
+	pairBarrier(t, d, b)
+}

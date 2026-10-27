@@ -2,10 +2,12 @@ package zerobus
 
 import (
 	"context"
+	"errors"
 	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 	"unsafe"
 )
 
@@ -347,12 +349,13 @@ func (d *Dispatcher) teardown(err error) {
 	close(d.done)
 }
 
-// Match selects signals. Empty fields match anything. Well-known senders
-// are filtered by the bus; only unique sender names are filtered locally.
+// Match selects signals. Empty fields match anything. Sender must be empty
+// or a unique name (starting with ':'). Resolve well-known names with
+// org.freedesktop.DBus.GetNameOwner before subscribing.
 type Match struct{ Sender, Path, Interface, Member string }
 
 func (m Match) matches(s *Message) bool {
-	return (m.Sender == "" || !strings.HasPrefix(m.Sender, ":") || m.Sender == s.Sender) && (m.Path == "" || m.Path == s.Path) && (m.Interface == "" || m.Interface == s.Interface) && (m.Member == "" || m.Member == s.Member)
+	return (m.Sender == "" || m.Sender == s.Sender) && (m.Path == "" || m.Path == s.Path) && (m.Interface == "" || m.Interface == s.Interface) && (m.Member == "" || m.Member == s.Member)
 }
 func (m Match) rule() string {
 	var b strings.Builder
@@ -397,12 +400,25 @@ func (d *Dispatcher) matchCall(ctx context.Context, member, rule string) error {
 }
 
 // Subscribe installs a bus match and a local stream with capacity buf (at least 1).
+// Nonempty Sender must start with ':'; resolve well-known names using
+// org.freedesktop.DBus.GetNameOwner first. If cancellation races AddMatch,
+// Subscribe attempts RemoveMatch with a fresh one-second context before returning.
 func (d *Dispatcher) Subscribe(ctx context.Context, m Match, buf int) (*Subscription, error) {
-	if buf < 1 {
+	if buf < 1 || (m.Sender != "" && !strings.HasPrefix(m.Sender, ":")) {
 		return nil, ErrInvalid
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 	rule := m.rule()
 	if err := d.matchCall(ctx, "AddMatch", rule); err != nil {
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			// AddMatch may already be installed even though its reply lost
+			// the cancellation race. Order cleanup after it on the same Conn.
+			cleanup, cancel := context.WithTimeout(context.WithoutCancel(ctx), time.Second)
+			_ = d.matchCall(cleanup, "RemoveMatch", rule)
+			cancel()
+		}
 		return nil, err
 	}
 	s := &Subscription{d: d, match: m, rule: rule, ch: make(chan *Msg, buf)}

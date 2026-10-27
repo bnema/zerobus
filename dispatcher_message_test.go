@@ -30,12 +30,12 @@ func TestDispatcherDetach(t *testing.T) {
 }
 func TestDispatcherMatch(t *testing.T) {
 	msg := &Message{Sender: ":1.2", Path: "/test", Interface: "org.example.Test", Member: "Changed"}
-	for _, m := range []Match{{}, {Sender: ":1.2"}, {Sender: "org.example.Service"}, {Path: "/test", Interface: "org.example.Test", Member: "Changed"}} {
+	for _, m := range []Match{{}, {Sender: ":1.2"}, {Path: "/test", Interface: "org.example.Test", Member: "Changed"}} {
 		if !m.matches(msg) {
 			t.Fatalf("did not match %+v", m)
 		}
 	}
-	for _, m := range []Match{{Sender: ":1.3"}, {Path: "/other"}, {Interface: "org.example.Other"}, {Member: "Other"}} {
+	for _, m := range []Match{{Sender: "org.example.Service"}, {Sender: ":1.3"}, {Path: "/other"}, {Interface: "org.example.Other"}, {Member: "Other"}} {
 		if m.matches(msg) {
 			t.Fatalf("matched %+v", m)
 		}

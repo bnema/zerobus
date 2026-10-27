@@ -248,3 +248,125 @@ func TestDispatcherMalformed(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestDispatcherSenderIsolation(t *testing.T) {
+	addr := privateBus(t)
+	a, b, c := dispatcher(t, addr), dispatcher(t, addr), dispatcher(t, addr)
+	ctx := context.Background()
+	broad, err := b.Subscribe(ctx, Match{Interface: "org.example.Test"}, 8)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer broad.Close(ctx)
+	narrow, err := b.Subscribe(ctx, Match{Sender: a.UniqueName(), Interface: "org.example.Test"}, 8)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer narrow.Close(ctx)
+	if s, err := b.Subscribe(ctx, Match{Sender: busName}, 1); s != nil || !errors.Is(err, ErrInvalid) {
+		t.Fatalf("well-known sender accepted: %v", err)
+	}
+	for _, emitter := range []*Dispatcher{a, c} {
+		emitter.NewSignal("/", "org.example.Test", "Changed", "")
+		if _, err := emitter.Send(); err != nil {
+			t.Fatal(err)
+		}
+		emitter.NewCall(b.UniqueName(), "/", "org.example.Test", "Barrier", "")
+		m, _ := emitter.Call(ctx)
+		m.Close()
+	}
+	for _, want := range []string{a.UniqueName(), c.UniqueName()} {
+		select {
+		case m := <-broad.C:
+			if m.Sender != want {
+				t.Fatal(m.Sender)
+			}
+			m.Close()
+		case <-time.After(5 * time.Second):
+			t.Fatal("missing broad signal")
+		}
+	}
+	select {
+	case m := <-narrow.C:
+		if m.Sender != a.UniqueName() {
+			t.Fatal(m.Sender)
+		}
+		m.Close()
+	default:
+		t.Fatal("missing sender signal")
+	}
+	select {
+	case m := <-narrow.C:
+		m.Close()
+		t.Fatal("wrong sender delivered")
+	default:
+	}
+}
+
+func TestDispatcherSubscriptionCloseRace(t *testing.T) {
+	addr := privateBus(t)
+	a := dispatcher(t, addr)
+	for range 20 {
+		b := dispatcher(t, addr)
+		s, err := b.Subscribe(context.Background(), Match{Interface: "org.example.Test"}, 2)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var wg sync.WaitGroup
+		wg.Go(func() {
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+			_ = s.Close(ctx)
+		})
+		wg.Go(func() { _ = b.Close() })
+		wg.Go(func() {
+			for range 10 {
+				a.NewSignal("/", "org.example.Test", "Changed", "")
+				if _, err := a.Send(); err != nil {
+					t.Error(err)
+					return
+				}
+			}
+		})
+		wg.Wait()
+		for m := range s.C {
+			m.Close()
+		}
+		waitDone(t, b.Done())
+	}
+}
+
+// cancelOnWait cancels when Call starts waiting, after Go has sent AddMatch.
+// It makes the otherwise timing-dependent cancellation window deterministic.
+type cancelOnWait struct {
+	context.Context
+	cancel context.CancelFunc
+}
+
+func (c cancelOnWait) Done() <-chan struct{} { c.cancel(); return c.Context.Done() }
+
+func TestDispatcherCanceledSubscribeBusRule(t *testing.T) {
+	d := dispatcher(t, privateBus(t))
+	match := Match{Interface: "org.example.Canceled"}
+	for _, afterSend := range []bool{false, true} {
+		ctx, cancel := context.WithCancel(context.Background())
+		var callCtx context.Context = ctx
+		if afterSend {
+			callCtx = cancelOnWait{Context: ctx, cancel: cancel}
+		} else {
+			cancel()
+		}
+		s, err := d.Subscribe(callCtx, match, 1)
+		cancel()
+		if s != nil || !errors.Is(err, context.Canceled) {
+			t.Fatalf("Subscribe = %v, %v", s, err)
+		}
+		// Bus rules are refcounted. If cleanup missed an installed rule, this
+		// second removal would succeed rather than return MatchRuleNotFound.
+		err = d.matchCall(context.Background(), "RemoveMatch", match.rule())
+		var e *Error
+		if !errors.As(err, &e) || e.Name != "org.freedesktop.DBus.Error.MatchRuleNotFound" {
+			t.Fatalf("rule remains installed: %v", err)
+		}
+	}
+}
